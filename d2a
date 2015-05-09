@@ -1,0 +1,179 @@
+#!/usr/bin/env python
+
+import os, os.path
+import time
+import sys
+import re
+import traceback
+import subprocess
+from argparse import ArgumentParser
+import enzyme
+
+VERSION="v0.0.1"
+
+MKVMERGE="/usr/bin/mkvmerge"
+MKVEXTRACT="/usr/bin/mkvextract"
+FFMPEG="/usr/bin/ffmpeg"
+
+class MkvConvert(object):
+    mkv = ""
+    description = "Converts DTS tracks in MKVs to AC3"
+
+    def main(self):
+        self.verbose = False
+
+        try:
+            self._run()
+        except SystemExit:
+            raise sys.exc_info()[1], None, sys.exc_info()[2]
+        except:
+            print "Error: %s" % (str(sys.exc_info()[1]))
+            if self.verbose:
+                traceback.print_tb(sys.exc_info()[2])
+            sys.exit(3)
+
+    def _run(self):
+        arg_parser = ArgumentParser(description= "%s (Version: %s" % (self.description, VERSION))
+        arg_parser.add_argument('-f', '--filename', type=str, required=True, help="mkv filename")
+        arg_parser.add_argument("-v", "--verbose", action="store_true", help="increase output verbosity")
+        args = arg_parser.parse_args(sys.argv[1:])
+
+        self.verbose = args.verbose
+
+        print "Processing file '%s'." % args.filename
+
+        open_ret = self.mkv_open(args.filename)
+        if not open_ret:
+            raise "Error: Cannot open file '%s'." % (args.filename)
+
+        if self.verbose:
+            self.mkv_info()
+
+        self.mkv_convert(args)
+
+        if self.verbose:
+            self.mkv_info()
+
+    def mkv_open(self, filename):
+        with open(filename, 'rb') as f:
+            self.mkv = enzyme.MKV(f).to_dict()
+            return True
+
+    def mkv_info(self):
+        print self.mkv["info"]
+        print self.mkv["video_tracks"]
+        print self.mkv["audio_tracks"]
+
+    def mkv_convert(self, args):
+        dts_tracks = []
+        all_tracks = []
+        found_ger = -1
+        new_file_name = args.filename.replace(".mkv", ".AC3.mkv")
+        new_file_name.strip("DTS\.")
+        new_file_name.strip("dts\.")
+
+        current_dir = os.getcwd()
+        working_dir = "%s/working-%s" % (current_dir, str(time.time()))
+        if not os.path.exists(working_dir):
+            os.makedirs(working_dir)
+
+        new_file = "%s/%s" % (current_dir, new_file_name)
+
+        for track in self.mkv["audio_tracks"]:
+            track_no = track["number"]-1 #wrong counting in enzyme
+
+            print "Audio Track %s: Type %s Language %s" % (track_no, track["codec_id"], track["language"])
+
+            all_tracks.append(track_no)
+
+            file_suffix = "ac3"
+            if "A_DTS" == track["codec_id"]:
+                if "ger" == track["language"]:
+                    found_ger = track_no
+
+                dts_tracks.append(track_no)
+                file_suffix = "dts"
+
+            # extract all audio tracks
+            track_id = str(track_no)
+            track_file = "%s/%s.%s" % (working_dir, track_id, file_suffix)
+
+            if os.path.exists(track_file):
+                print "track file '%s' already existing. Skipping..." % track_file
+                continue
+
+            print "Extracting track %s to '%s'." % (track_id, track_file)
+            cmd = (MKVEXTRACT, "tracks", args.filename, "%s:%s" % (track_id, track_file))
+
+            print >> sys.stderr, "Processing...",
+            mkvextract = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = mkvextract.communicate()
+            if mkvextract.returncode != 0:
+                print >> sys.stderr, "Failed"
+
+            print >> sys.stderr, "Succeeded"
+
+        # only convert dts tracks
+        print "Converting all DTS tracks."
+        for track in dts_tracks:
+            if track < 0:
+                continue
+
+            track_id = str(track)
+
+            track_file = "%s/%s.dts" % (working_dir, track_id)
+            ac3_file = "%s/%s.ac3" % (working_dir, track_id)
+
+            if os.path.exists(ac3_file):
+                print "ac3 file '%s' already existing. Skipping..." % ac3_file
+                continue
+
+            print "Converting dts file '%s' to '%s'" % (track_file, ac3_file)
+            cmd = (FFMPEG, "-i", track_file, "-acodec", "ac3", "-ac", "6", "-ab", "448k", ac3_file)
+
+            print >> sys.stderr, "Processing...",
+            ffmpeg = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = ffmpeg.communicate()
+            if ffmpeg.returncode != 0:
+                print >> sys.stderr, "Failed"
+
+            print >> sys.stderr, "Succeeded"
+
+        # put all audio tracks back together
+        print "Muxing all audio streams together."
+        cmd = [MKVMERGE, "-A", "-o", new_file, args.filename]
+
+        for track in sorted(all_tracks):
+            track_id = str(track)
+            ac3_file = "%s/%s.ac3" % (working_dir, track_id)
+            print "Adding track %s from file '%s'" % (track_id, ac3_file)
+            cmd += [ac3_file]
+            #cmd += [ac3_file, "--language", "%s:%s" % (track_id, self.mkv_get_lang_track(track))]
+
+        if found_ger >= 0: #set german as default track
+            cmd += ["--default-track", str(found_ger)]
+
+        print >> sys.stderr, "Processing..."
+        if self.verbose:
+            print " ".join(cmd)
+
+        mkvmerge = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = mkvmerge.communicate()
+        if mkvmerge.returncode != 0:
+            print >> sys.stderr, "Failed"
+
+        print >> sys.stderr, "Succeeded"
+
+        print "Done: New file '%s'" % (new_file)
+
+    def mkv_get_lang_track(self, track_no):
+        for track in self.mkv["audio_tracks"]:
+            if track["number"] == track_no:
+                return track["language"]
+
+        return "none"
+
+if __name__ == "__main__":
+    MkvConvert().main()
+
+
